@@ -1,0 +1,15 @@
+{
+    "manifest_version": 3,
+    "name": "Discord Mood Highlighter",
+    "version": "1.0",
+    "description": "Tints just this server’s Discord page based on bot-detected mood.",
+    "content_scripts": [
+      {
+        "matches": [
+          "https://discord.com/channels/1374773287204421633/*"
+        ],
+        "js": ["content.js"]
+      }
+    ]
+  }
+  
