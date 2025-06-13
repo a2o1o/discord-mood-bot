@@ -1,0 +1,8 @@
+playwright==1.52.0
+yfinance
+pandas
+matplotlib
+scikit-learn
+transformers
+torch
+requests
