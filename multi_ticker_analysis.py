@@ -13,14 +13,27 @@ import matplotlib.pyplot as plt
 import sys
 import time
 import argparse
-from finnhub_news_fetcher import fetch_news_finnhub_monthly, normalize_dates
+from finnhub_news_fetcher import fetch_news_finnhub_monthly, normalize_dates, fetch_news_finnhub_for_range
 from dateutil.relativedelta import relativedelta
+import numpy as np
+import re
+import requests_cache
+import logging
+import feedparser
+import urllib.parse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Cache Yahoo Finance requests
+requests_cache.install_cache("yahoo_news_cache", expire_after=86400)
 
 # List of tickers to analyze
 TICKERS = ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'TSLA', 'BRK-B', 'META', 'LLY', 'AVGO']
 
 # Default Finnhub API key
-DEFAULT_FINNHUB_API_KEY = "d18ski9r01qkcat4kf10d18ski9r01qkcat4kf1g"
+DEFAULT_FINNHUB_API_KEY = "d1bvh0pr01qre5aip1ngd1bvh0pr01qre5aip1o0"
 
 def fetch_price_data(ticker: str, years: int = 5) -> pd.DataFrame:
     """
@@ -56,9 +69,64 @@ def fetch_price_data(ticker: str, years: int = 5) -> pd.DataFrame:
         print(f"Error fetching price data for {ticker}: {e}")
         return pd.DataFrame()
 
+def fetch_news_google_rss(ticker, start_date, end_date):
+    """
+    Returns list of headlines for `ticker` between start_date and end_date
+    via Google News RSS with a 5-year filter.
+    """
+    # URL-encode ticker and time filter
+    query = urllib.parse.quote_plus(f"{ticker} when:5y")
+    url = f"https://news.google.com/rss/search?q={query}"
+    feed = feedparser.parse(url)
+    headlines = []
+    for entry in feed.entries:
+        try:
+            pub_dt = datetime.datetime(*entry.published_parsed[:6]).date()
+            if start_date <= pub_dt <= end_date:
+                # Convert date to unix timestamp for compatibility with normalize_dates
+                timestamp = int(time.mktime(pub_dt.timetuple()))
+                headlines.append({'headline': entry.title, 'datetime': timestamp})
+        except Exception:
+            # Ignore entries with parsing errors
+            continue
+    return headlines
+
 def fetch_news_data(ticker: str, start_date: datetime.date, end_date: datetime.date, api_key: str, years: int = 5) -> List[Dict]:
-    # Just return all articles, no manual filtering
-    return fetch_news_finnhub_monthly(ticker, api_key, years=years)
+    """
+    Fetches news data by iterating month by month.
+    Uses Finnhub for 2025 and Google News RSS for all other years.
+    """
+    all_articles = []
+    current_start = start_date
+
+    while current_start <= end_date:
+        # Define the end of the current monthly window
+        current_end = current_start + relativedelta(months=1) - relativedelta(days=1)
+        if current_end > end_date:
+            current_end = end_date
+        
+        src = ""
+        articles_for_window = []
+        if current_start.year == 2025:
+            # Finnhub for 2025
+            articles_for_window = fetch_news_finnhub_for_range(ticker, api_key, current_start, current_end)
+            src = "Finnhub"
+            time.sleep(1) # Respect Finnhub rate limits
+        else:
+            # Google News RSS for other years
+            articles_for_window = fetch_news_google_rss(ticker, current_start, current_end)
+            src = "GoogleRSS"
+
+        logger.info(f"{ticker} {current_start.strftime('%Y-%m-%d')}–{current_end.strftime('%Y-%m-%d')}: fetched {len(articles_for_window)} articles via {src}")
+        if articles_for_window:
+            all_articles.extend(articles_for_window)
+
+        # Move to the start of the next month
+        current_start += relativedelta(months=1)
+        # Ensure we start exactly on the 1st of the next month to handle varying month lengths
+        current_start = current_start.replace(day=1)
+
+    return all_articles
 
 def compute_sentiment(headlines: List[str], sentiment_model) -> List[float]:
     """
@@ -121,6 +189,106 @@ def merge_data(price_data: pd.DataFrame, news_data: List[dict], sentiment_model,
         merged_data['sentiment'] = 0.0
     merged_data['sentiment'].fillna(0.0, inplace=True)
     return merged_data
+
+def extract_close_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Extract the best available price series from a DataFrame.
+    
+    Args:
+        df: DataFrame containing price data
+        
+    Returns:
+        pd.Series: The selected price series
+        
+    Raises:
+        ValueError: If DataFrame is empty
+        KeyError: If no numeric price column is found
+    """
+    if df.empty:
+        raise ValueError("Empty DataFrame—no price data")
+    
+    # Handle MultiIndex columns by flattening to single-level
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+    
+    print(f"extract_close_series: flattened columns: {df.columns.tolist()}")
+    
+    # If all columns have the same name (like '^GSPC'), select the first one by position
+    if len(set(df.columns)) == 1:
+        print(f"extract_close_series: all columns have same name '{df.columns[0]}', selecting first column")
+        series = df.iloc[:, 0]
+        print(f"extract_close_series: selected first column (type: {type(series)})")
+        return series
+    
+    # Helper to get first column as Series by position
+    def get_first_col_series(col_name):
+        matches = [i for i, c in enumerate(df.columns) if c == col_name]
+        if matches:
+            col_idx = matches[0]
+            series = df.iloc[:, col_idx]
+            print(f"extract_close_series: selected column '{df.columns[col_idx]}' at position {col_idx} (type: {type(series)})")
+            return series
+        return None
+    
+    # Try to get 'Close' column first
+    close = get_first_col_series('Close')
+    if close is not None:
+        return close
+    
+    # Fall back to 'Adj Close' if 'Close' not available
+    adj_close = get_first_col_series('Adj Close')
+    if adj_close is not None:
+        return adj_close
+    
+    # Last resort: find first numeric column by position
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) == 0:
+        raise KeyError("No numeric price column found")
+    
+    # Get the first numeric column by position to avoid duplicate name issues
+    first_numeric_idx = df.columns.get_loc(numeric_cols[0])
+    series = df.iloc[:, first_numeric_idx]
+    print(f"extract_close_series: selected numeric column '{df.columns[first_numeric_idx]}' at position {first_numeric_idx} (type: {type(series)})")
+    return series
+
+def add_sp500_return_feature(stock_df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Add S&P 500 daily returns as a feature to the stock DataFrame.
+    
+    Args:
+        stock_df: DataFrame containing stock data with datetime index
+        start_date: Start date for S&P 500 data fetch (YYYY-MM-DD format)
+        end_date: End date for S&P 500 data fetch (YYYY-MM-DD format)
+        
+    Returns:
+        pd.DataFrame: Original stock DataFrame with 'SP_Return' column added
+    """
+    sp500 = yf.download("^GSPC", start=start_date, end=end_date, progress=False, auto_adjust=False)
+    print("SP500 columns:", sp500.columns.tolist())
+    print("SP500 sample:\n", sp500.head())
+    try:
+        close_series = extract_close_series(sp500)
+        print("Extracted close_series type:", type(close_series))
+        print("Extracted close_series head:\n", close_series.head())
+        sp500_returns = close_series.pct_change()
+        # Ensure sp500_returns is a Series with a DateTime index
+        if not isinstance(sp500_returns, pd.Series):
+            raise ValueError("sp500_returns is not a Series")
+        if not isinstance(sp500_returns.index, pd.DatetimeIndex):
+            raise ValueError("sp500_returns index is not DatetimeIndex")
+        sp500_df = pd.DataFrame({'SP_Return': sp500_returns})
+        print("sp500_df head:\n", sp500_df.head())
+        merged_df = stock_df.merge(
+            sp500_df, 
+            left_index=True, 
+            right_index=True, 
+            how="left"
+        )
+        return merged_df
+    except (ValueError, KeyError) as e:
+        print(f"SP500 feature skipped: {e}")
+        stock_df["SP_Return"] = np.nan
+        return stock_df
 
 def prepare_features(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     """
@@ -208,13 +376,22 @@ def plot_sentiment_vs_price(data: pd.DataFrame, ticker: str, save_dir: str = "pl
         ax2.tick_params(axis='y', labelcolor='red')
         ax2.set_ylim(-1.1, 1.1)
         
+        # Plot S&P 500 return (secondary right y-axis, offset)
+        ax3 = ax1.twinx()
+        ax3.spines['right'].set_position(('outward', 60))
+        ax3.plot(data.index, data['SP_Return'], color='green', linewidth=1, linestyle=':', alpha=0.7, label='S&P 500 Return')
+        ax3.set_ylabel('S&P 500 Daily Return', color='green', fontsize=12)
+        ax3.tick_params(axis='y', labelcolor='green')
+        ax3.set_ylim(-0.05, 0.05)
+        
         # Add title and legend
-        plt.title(f'{ticker} - Daily Close Price vs Sentiment Score', fontsize=14, fontweight='bold')
+        plt.title(f'{ticker} - Daily Close Price, Sentiment, and S&P 500 Return', fontsize=14, fontweight='bold')
         
         # Add legends
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        lines3, labels3 = ax3.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc='upper left')
         
         plt.tight_layout()
         
@@ -228,101 +405,118 @@ def plot_sentiment_vs_price(data: pd.DataFrame, ticker: str, save_dir: str = "pl
     except Exception as e:
         print(f"Error creating plot for {ticker}: {e}")
 
+def save_sentiment_data(data: pd.DataFrame, ticker: str, save_dir: str = "results"):
+    """
+    Save DataFrame with sentiment scores to a CSV file.
+    
+    Args:
+        data: DataFrame with price and sentiment data
+        ticker: Stock symbol
+        save_dir: Directory to save the CSV file
+    """
+    try:
+        # Create results directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        
+        filename = os.path.join(save_dir, f'sentiment_data_{ticker}.csv')
+        
+        # Save the data to a CSV file
+        data.to_csv(filename)
+        
+        print(f"✓ Saved sentiment data to: {filename}")
+        
+    except Exception as e:
+        print(f"Error saving sentiment data for {ticker}: {e}")
+
 def analyze_ticker(ticker: str, api_key: str, years: int = 5) -> Dict:
-    print(f"\n{'='*60}")
-    print(f"Analyzing {ticker}")
-    print(f"{'='*60}")
-    price_data = fetch_price_data(ticker, years)
-    if price_data.empty:
-        return {'ticker': ticker, 'success': False, 'error': 'No price data'}
+    """
+    Perform full analysis for a single ticker.
+    """
+    print(f"\n{'='*60}\nAnalyzing {ticker}\n{'='*60}")
+    
+    # 1. Fetch data
     end_date = datetime.date.today()
     start_date = end_date - relativedelta(years=years)
     if start_date.year < 1:
         start_date = datetime.date(1, 1, 1)
-    raw_news = fetch_news_data(ticker, start_date, end_date, api_key, years=years)
+
+    price_data = fetch_price_data(ticker, years=years)
+    if price_data.empty:
+        return {'ticker': ticker, 'success': False, 'error': 'No price data'}
+
+    news_data = fetch_news_data(ticker, start_date, end_date, api_key, years=years)
+    print(f"✓ Fetched {len(news_data)} news articles for {ticker}")
+    
+    # 2. Load sentiment model
     print("Loading sentiment model...")
-    sentiment_model = pipeline(
-        "sentiment-analysis",
-        model="ProsusAI/finbert",
-        tokenizer="ProsusAI/finbert",
-    )
-    merged_data = merge_data(price_data, raw_news, sentiment_model, start_date, end_date)
-    if merged_data.empty:
-        return {'ticker': ticker, 'success': False, 'error': 'No merged data'}
+    sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert", device="mps:0" if "mps" in sys.modules else "cpu")
+    print(f"Device set to use {sentiment_model.device}")
+    
+    # 3. Merge data
+    merged_data = merge_data(price_data, news_data, sentiment_model, start_date, end_date)
+    
+    # 4. Add S&P 500 feature
+    merged_data = add_sp500_return_feature(merged_data, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+
+    # Save sentiment data to CSV
+    save_sentiment_data(merged_data, ticker)
+
+    # 5. Prepare features
     X, y = prepare_features(merged_data)
-    if len(X) == 0:
-        return {'ticker': ticker, 'success': False, 'error': 'No features'}
+    
+    if X.empty or y.empty:
+        return {'ticker': ticker, 'success': False, 'error': 'Not enough data for training'}
+    
+    # 6. Train and evaluate model
     model, accuracy = train_and_evaluate(X, y, ticker)
+    if model:
+        print(f"✓ {ticker} Model Accuracy: {accuracy:.3f} ({len(X)} samples)")
+    
+    # 7. Plot results
     plot_sentiment_vs_price(merged_data, ticker)
-    return {
-        'ticker': ticker,
-        'success': True,
-        'accuracy': accuracy,
-        'samples': len(X),
-        'model': model,
-        'data': merged_data
+    
+    analysis_result = {
+        'ticker': ticker, 
+        'success': True, 
+        'accuracy': accuracy, 
+        'samples': len(X)
     }
+    return analysis_result
 
 def main():
-    """Main function to run analysis for specified tickers."""
-    print("Multi-Ticker Sentiment Analysis")
-    print("=" * 40)
-    
-    parser = argparse.ArgumentParser(description="Multi-Ticker Sentiment Analysis")
-    parser.add_argument('tickers', nargs='+', help="List of tickers or 'ALL' for default set")
-    parser.add_argument('--years', '-y', type=int, default=5, help="Number of years to analyze (default: 5)")
+    """
+    Main function to run the analysis for all tickers.
+    """
+    parser = argparse.ArgumentParser(description="Stock Price and Sentiment Analysis")
+    parser.add_argument("ticker", nargs='?', default=None, help="Optional: Specific ticker to analyze")
+    parser.add_argument("--years", type=int, default=5, help="Number of years for historical data")
     args = parser.parse_args()
     
-    api_key = os.getenv('FINNHUB_API_KEY', DEFAULT_FINNHUB_API_KEY)
+    # Use environment variable for API key if available
+    api_key = os.environ.get("FINNHUB_API_KEY", DEFAULT_FINNHUB_API_KEY)
     
-    if args.tickers[0].upper() == 'ALL':
-        tickers_to_run = TICKERS
-    else:
-        tickers_to_run = [t.upper() for t in args.tickers]
-    years = args.years
-    
-    os.makedirs('results', exist_ok=True)
-    
-    results = []
-    for ticker in tickers_to_run:
-        try:
-            result = analyze_ticker(ticker, api_key, years=years)
-            results.append(result)
-        except Exception as e:
-            print(f"Error analyzing {ticker}: {e}")
-            results.append({'ticker': ticker, 'success': False, 'error': str(e)})
-    
-    # Print summary
-    print(f"\n{'='*60}")
-    print("ANALYSIS SUMMARY")
-    print(f"{'='*60}")
-    
-    successful_analyses = [r for r in results if r['success']]
-    failed_analyses = [r for r in results if not r['success']]
-    
-    print(f"Successful analyses: {len(successful_analyses)}/{len(tickers_to_run)}")
-    print(f"Failed analyses: {len(failed_analyses)}")
-    
-    if successful_analyses:
-        print(f"\nModel Accuracies:")
-        for result in successful_analyses:
-            print(f"  {result['ticker']}: {result['accuracy']:.3f} ({result['samples']} samples)")
+    if not api_key:
+        print("Error: Finnhub API key not found. Please set the FINNHUB_API_KEY environment variable.")
+        sys.exit(1)
         
-        avg_accuracy = sum(r['accuracy'] for r in successful_analyses) / len(successful_analyses)
-        print(f"\nAverage Accuracy: {avg_accuracy:.3f}")
+    all_results = {}
     
-    if failed_analyses:
-        print(f"\nFailed Analyses:")
-        for result in failed_analyses:
-            print(f"  {result['ticker']}: {result.get('error', 'Unknown error')}")
+    tickers_to_process = [args.ticker] if args.ticker else TICKERS
+
+    for ticker in tickers_to_process:
+        print(f"\nAnalyzing {ticker}...")
+        results = analyze_ticker(ticker, api_key, years=args.years)
+        all_results[ticker] = results
+        
+    # Save results to a JSON file
+    # Create the results directory if it doesn't exist
+    os.makedirs("results", exist_ok=True)
     
-    # Save results
-    results_file = os.path.join('results', 'analysis_results.json')
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    
-    print(f"\nResults saved to: {results_file}")
-    print("Plots saved to: plots/")
+    # Save results to a JSON file
+    with open("results/analysis_results.json", "w") as f:
+        json.dump(all_results, f, indent=4)
+        
+    print("\nAnalysis complete. Results saved to results/analysis_results.json")
 
 if __name__ == "__main__":
-    main() 
+    main()

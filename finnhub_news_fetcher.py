@@ -39,6 +39,27 @@ def fetch_news_finnhub_monthly(ticker: str, api_key: str, years: int = 5) -> Lis
     print(f"✓ Fetched {len(articles)} news articles for {ticker}")
     return articles
 
+def fetch_news_finnhub_for_range(ticker: str, api_key: str, start_date: datetime.date, end_date: datetime.date) -> List[Dict]:
+    """
+    Fetch news articles for a ticker from Finnhub for a specific date range.
+    """
+    from_str = start_date.strftime('%Y-%m-%d')
+    to_str = end_date.strftime('%Y-%m-%d')
+    print(f"Fetching Finnhub news for {ticker}: {from_str} to {to_str}")
+    url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={from_str}&to={to_str}&token={api_key}"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        else:
+            print(f"Finnhub returned non-list data: {data}")
+            return []
+    except Exception as e:
+        print(f"Error fetching Finnhub news for {from_str} to {to_str}: {e}")
+        return []
+
 def normalize_dates(raw_news: List[Dict], start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
     """
     - Parses each article's 'datetime' (UNIX ts) into a date.
