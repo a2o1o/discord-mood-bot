@@ -8,49 +8,52 @@ import yfinance as yf
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 import matplotlib.pyplot as plt
 import sys
-import time
 import argparse
-from finnhub_news_fetcher import fetch_news_finnhub_monthly, normalize_dates, fetch_news_finnhub_for_range
 from dateutil.relativedelta import relativedelta
 import numpy as np
 import re
-import requests_cache
 import logging
-import feedparser
-import urllib.parse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Cache Yahoo Finance requests
-requests_cache.install_cache("yahoo_news_cache", expire_after=86400)
-
 # List of tickers to analyze
 TICKERS = ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'TSLA', 'BRK-B', 'META', 'LLY', 'AVGO']
 
-# Default Finnhub API key
-DEFAULT_FINNHUB_API_KEY = "d1bvh0pr01qre5aip1ngd1bvh0pr01qre5aip1o0"
+TICKER_KEYWORDS = {
+    'AAPL': ['AAPL', 'Apple'],
+    'MSFT': ['MSFT', 'Microsoft'],
+    'AMZN': ['AMZN', 'Amazon'],
+    'NVDA': ['NVDA', 'Nvidia', 'NVIDIA'],
+    'GOOGL': ['GOOGL', 'Google', 'Alphabet'],
+    'TSLA': ['TSLA', 'Tesla','TESLA'],
+    'BRK-B': ['BRK-B', 'Berkshire Hathaway'],
+    'META': ['META', 'Facebook','Instagram'],
+    'LLY': ['LLY', 'Lilly', 'Eli Lilly'],
+    'AVGO': ['AVGO', 'Broadcom']
+}
 
-def fetch_price_data(ticker: str, years: int = 5) -> pd.DataFrame:
+# Load FinBERT
+tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+model     = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+
+def fetch_price_data(ticker: str, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
     """
     Fetch historical price data from yfinance.
     
     Args:
         ticker: Stock symbol
-        years: Number of years of data to fetch
+        start_date: Start date for data fetch
+        end_date: End date for data fetch
         
     Returns:
         DataFrame with OHLCV data
     """
     try:
-        end_date = datetime.date.today()
-        start_date = end_date - relativedelta(years=years)
-        if start_date.year < 1:
-            start_date = datetime.date(1, 1, 1)
         data = yf.download(ticker, start=start_date, end=end_date, progress=False)
         
         if data.empty:
@@ -69,64 +72,61 @@ def fetch_price_data(ticker: str, years: int = 5) -> pd.DataFrame:
         print(f"Error fetching price data for {ticker}: {e}")
         return pd.DataFrame()
 
-def fetch_news_google_rss(ticker, start_date, end_date):
+def fetch_external_headlines(ticker: str, start_date: datetime.date, end_date: datetime.date) -> list[dict]:
     """
-    Returns list of headlines for `ticker` between start_date and end_date
-    via Google News RSS with a 5-year filter.
+    Fetch headlines for a ticker from All_external.csv for the given date range.
+    Returns a list of dicts: {"headline": ..., "datetime": ..., "date": ...}
+    Caches results to disk and loads from cache if available.
     """
-    # URL-encode ticker and time filter
-    query = urllib.parse.quote_plus(f"{ticker} when:5y")
-    url = f"https://news.google.com/rss/search?q={query}"
-    feed = feedparser.parse(url)
+    os.makedirs("external_headlines_cache", exist_ok=True)
+    cache_file = f"external_headlines_cache/{ticker}_{start_date}_{end_date}.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            return json.load(f)
     headlines = []
-    for entry in feed.entries:
-        try:
-            pub_dt = datetime.datetime(*entry.published_parsed[:6]).date()
-            if start_date <= pub_dt <= end_date:
-                # Convert date to unix timestamp for compatibility with normalize_dates
-                timestamp = int(time.mktime(pub_dt.timetuple()))
-                headlines.append({'headline': entry.title, 'datetime': timestamp})
-        except Exception:
-            # Ignore entries with parsing errors
-            continue
-    return headlines
-
-def fetch_news_data(ticker: str, start_date: datetime.date, end_date: datetime.date, api_key: str, years: int = 5) -> List[Dict]:
-    """
-    Fetches news data by iterating month by month.
-    Uses Finnhub for 2025 and Google News RSS for all other years.
-    """
-    all_articles = []
-    current_start = start_date
-
-    while current_start <= end_date:
-        # Define the end of the current monthly window
-        current_end = current_start + relativedelta(months=1) - relativedelta(days=1)
-        if current_end > end_date:
-            current_end = end_date
+    try:
+        # Read in chunks for large file
+        chunk_iter = pd.read_csv("All_external.csv", chunksize=100_000, dtype=str)
         
-        src = ""
-        articles_for_window = []
-        if current_start.year == 2025:
-            # Finnhub for 2025
-            articles_for_window = fetch_news_finnhub_for_range(ticker, api_key, current_start, current_end)
-            src = "Finnhub"
-            time.sleep(1) # Respect Finnhub rate limits
-        else:
-            # Google News RSS for other years
-            articles_for_window = fetch_news_google_rss(ticker, current_start, current_end)
-            src = "GoogleRSS"
+        # Make start/end dates timezone-aware to match the data
+        start_ts = pd.Timestamp(start_date, tz="UTC")
+        end_ts = pd.Timestamp(end_date, tz="UTC")
 
-        logger.info(f"{ticker} {current_start.strftime('%Y-%m-%d')}–{current_end.strftime('%Y-%m-%d')}: fetched {len(articles_for_window)} articles via {src}")
-        if articles_for_window:
-            all_articles.extend(articles_for_window)
+        keywords = TICKER_KEYWORDS.get(ticker, [ticker])
+        pattern = r'\b(' + '|'.join(map(re.escape, keywords)) + r')\b'
 
-        # Move to the start of the next month
-        current_start += relativedelta(months=1)
-        # Ensure we start exactly on the 1st of the next month to handle varying month lengths
-        current_start = current_start.replace(day=1)
+        for chunk in chunk_iter:
+            # Convert 'Date' column to datetime
+            chunk["Date"] = pd.to_datetime(chunk["Date"], errors="coerce", utc=True)
+            
+            # Drop rows where date conversion failed
+            chunk.dropna(subset=['Date'], inplace=True)
 
-    return all_articles
+            # Filter by stock symbol, title keywords, and date range
+            stock_symbol_mask = chunk['Stock_symbol'] == ticker
+            title_mask = chunk['Article_title'].str.contains(pattern, case=False, na=False, regex=True)
+            date_mask = (chunk["Date"] >= start_ts) & (chunk["Date"] <= end_ts)
+            
+            chunk = chunk[(stock_symbol_mask | title_mask) & date_mask]
+            
+            for _, row in chunk.iterrows():
+                title = row["Article_title"]
+                date = row["Date"]
+                if pd.isnull(title) or pd.isnull(date):
+                    continue
+                # Convert date to timestamp
+                try:
+                    dt = pd.to_datetime(date, utc=True)
+                    timestamp = int(dt.timestamp())
+                except Exception:
+                    continue
+                headlines.append({"headline": title, "datetime": timestamp, "date": dt.date()})
+    except Exception as e:
+        print(f"Error reading All_external.csv: {e}")
+    print(f"✓ All_external: Found {len(headlines)} news items for {ticker}")
+    with open(cache_file, "w") as f:
+        json.dump(headlines, f, indent=2, default=str)
+    return headlines
 
 def compute_sentiment(headlines: List[str], sentiment_model) -> List[float]:
     """
@@ -164,30 +164,46 @@ def compute_sentiment(headlines: List[str], sentiment_model) -> List[float]:
 def merge_data(price_data: pd.DataFrame, news_data: List[dict], sentiment_model, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
     if price_data.empty:
         return pd.DataFrame()
+
+    # Ensure the price_data index is a timezone-naive DatetimeIndex at midnight
     merged_data = price_data.copy()
-    # Normalize news dates and headlines
-    news_df = normalize_dates(news_data, start_date, end_date)
-    if news_df.empty:
-        print(f"Warning: no valid news for this period")
-    # Group headlines by date
-    daily_sentiments = news_df.groupby('date')['headline'].apply(list).to_dict()
-    sentiment_scores = []
-    dates = []
-    for date, headlines in daily_sentiments.items():
-        if date in merged_data.index.date:
+    merged_data.index = pd.to_datetime(merged_data.index).normalize()
+    merged_data['sentiment'] = 0.0 # Default to 0
+
+    if not news_data:
+        print("Warning: No news data to merge.")
+        return merged_data
+
+    news_df = pd.DataFrame(news_data)
+    if 'date' not in news_df.columns or 'headline' not in news_df.columns:
+        print("Warning: News data is missing 'date' or 'headline' column.")
+        return merged_data
+
+    # Convert date column to datetime objects and normalize to midnight
+    news_df['date'] = pd.to_datetime(news_df['date']).dt.normalize()
+
+    # Group headlines by day
+    daily_headlines = news_df.groupby('date')['headline'].apply(list)
+
+    # Compute average sentiment for each day
+    daily_sentiment_scores = {}
+    for date, headlines in daily_headlines.items():
+        if headlines:
             scores = compute_sentiment(headlines, sentiment_model)
             if scores:
-                avg_sentiment = sum(scores) / len(scores)
-                sentiment_scores.append(avg_sentiment)
-                dates.append(date)
-    if sentiment_scores:
-        sentiment_df = pd.DataFrame({'date': dates, 'sentiment': sentiment_scores})
-        sentiment_df['date'] = pd.to_datetime(sentiment_df['date'])
-        sentiment_df.set_index('date', inplace=True)
-        merged_data = merged_data.join(sentiment_df, how='left')
-    else:
-        merged_data['sentiment'] = 0.0
-    merged_data['sentiment'].fillna(0.0, inplace=True)
+                daily_sentiment_scores[date] = np.mean(scores)
+    
+    if not daily_sentiment_scores:
+        print("Warning: Could not compute any daily sentiment scores.")
+        return merged_data
+    
+    # Create sentiment Series with a DatetimeIndex
+    sentiment_series = pd.Series(daily_sentiment_scores, name='sentiment')
+
+    # Update the sentiment in the main DataFrame
+    # This will align on the index and update values where dates match
+    merged_data.update(sentiment_series)
+    
     return merged_data
 
 def extract_close_series(df: pd.DataFrame) -> pd.Series:
@@ -428,53 +444,38 @@ def save_sentiment_data(data: pd.DataFrame, ticker: str, save_dir: str = "result
     except Exception as e:
         print(f"Error saving sentiment data for {ticker}: {e}")
 
-def analyze_ticker(ticker: str, api_key: str, years: int = 5) -> Dict:
-    """
-    Perform full analysis for a single ticker.
-    """
-    print(f"\n{'='*60}\nAnalyzing {ticker}\n{'='*60}")
-    
-    # 1. Fetch data
-    end_date = datetime.date.today()
-    start_date = end_date - relativedelta(years=years)
-    if start_date.year < 1:
-        start_date = datetime.date(1, 1, 1)
+def fetch_news_data(ticker: str, start_date: datetime.date, end_date: datetime.date, years: int = 5) -> list[dict]:
+    return fetch_external_headlines(ticker, start_date, end_date)
 
-    price_data = fetch_price_data(ticker, years=years)
+def parse_date_arg(date_str: str) -> datetime.date:
+    return pd.to_datetime(date_str).date()
+
+def analyze_ticker(ticker: str, years: int = None, start_date: datetime.date = None, end_date: datetime.date = None) -> dict:
+    print(f"\n{'='*60}\nAnalyzing {ticker}\n{'='*60}")
+    if start_date is None or end_date is None:
+        end_date = datetime.date.today()
+        years = years if years else 5
+        start_date = end_date - relativedelta(years=years)
+        if start_date.year < 1:
+            start_date = datetime.date(1, 1, 1)
+    price_data = fetch_price_data(ticker, start_date=start_date, end_date=end_date)
     if price_data.empty:
         return {'ticker': ticker, 'success': False, 'error': 'No price data'}
-
-    news_data = fetch_news_data(ticker, start_date, end_date, api_key, years=years)
+    news_data = fetch_external_headlines(ticker, start_date, end_date)
     print(f"✓ Fetched {len(news_data)} news articles for {ticker}")
-    
-    # 2. Load sentiment model
     print("Loading sentiment model...")
     sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert", device="mps:0" if "mps" in sys.modules else "cpu")
     print(f"Device set to use {sentiment_model.device}")
-    
-    # 3. Merge data
     merged_data = merge_data(price_data, news_data, sentiment_model, start_date, end_date)
-    
-    # 4. Add S&P 500 feature
     merged_data = add_sp500_return_feature(merged_data, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-
-    # Save sentiment data to CSV
     save_sentiment_data(merged_data, ticker)
-
-    # 5. Prepare features
     X, y = prepare_features(merged_data)
-    
     if X.empty or y.empty:
         return {'ticker': ticker, 'success': False, 'error': 'Not enough data for training'}
-    
-    # 6. Train and evaluate model
     model, accuracy = train_and_evaluate(X, y, ticker)
     if model:
         print(f"✓ {ticker} Model Accuracy: {accuracy:.3f} ({len(X)} samples)")
-    
-    # 7. Plot results
     plot_sentiment_vs_price(merged_data, ticker)
-    
     analysis_result = {
         'ticker': ticker, 
         'success': True, 
@@ -484,38 +485,35 @@ def analyze_ticker(ticker: str, api_key: str, years: int = 5) -> Dict:
     return analysis_result
 
 def main():
-    """
-    Main function to run the analysis for all tickers.
-    """
     parser = argparse.ArgumentParser(description="Stock Price and Sentiment Analysis")
     parser.add_argument("ticker", nargs='?', default=None, help="Optional: Specific ticker to analyze")
-    parser.add_argument("--years", type=int, default=5, help="Number of years for historical data")
+    parser.add_argument("--years", type=int, default=None, help="Number of years for historical data (ignored if --start-date is given)")
+    parser.add_argument("--start-date", type=str, default=None, help="Start date for analysis (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default=None, help="End date for analysis (YYYY-MM-DD, default: today)")
     args = parser.parse_args()
-    
-    # Use environment variable for API key if available
-    api_key = os.environ.get("FINNHUB_API_KEY", DEFAULT_FINNHUB_API_KEY)
-    
-    if not api_key:
-        print("Error: Finnhub API key not found. Please set the FINNHUB_API_KEY environment variable.")
-        sys.exit(1)
-        
     all_results = {}
-    
     tickers_to_process = [args.ticker] if args.ticker else TICKERS
+
+    # Determine date range
+    if args.start_date:
+        start_date = parse_date_arg(args.start_date)
+        end_date = parse_date_arg(args.end_date) if args.end_date else datetime.date.today()
+        years = None
+    else:
+        end_date = datetime.date.today()
+        years = args.years if args.years else 5
+        start_date = end_date - relativedelta(years=years)
+        if start_date.year < 1:
+            start_date = datetime.date(1, 1, 1)
+    print(f"Analysis window: {start_date} to {end_date}")
 
     for ticker in tickers_to_process:
         print(f"\nAnalyzing {ticker}...")
-        results = analyze_ticker(ticker, api_key, years=args.years)
+        results = analyze_ticker(ticker, start_date=start_date, end_date=end_date)
         all_results[ticker] = results
-        
-    # Save results to a JSON file
-    # Create the results directory if it doesn't exist
     os.makedirs("results", exist_ok=True)
-    
-    # Save results to a JSON file
     with open("results/analysis_results.json", "w") as f:
         json.dump(all_results, f, indent=4)
-        
     print("\nAnalysis complete. Results saved to results/analysis_results.json")
 
 if __name__ == "__main__":
